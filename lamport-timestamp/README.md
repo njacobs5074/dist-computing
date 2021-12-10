@@ -1,11 +1,13 @@
 ## Lamport Timestamp
 
-This project implements a toy version of Leslie Lamport's timestamp algorithm for distributed computing as described
-in ["Time, Clock, and the Ordering of Events in a Distributed System"](http://research.microsoft.com/users/lamport/pubs/time-clocks.pdf).
+This project implements a toy version of Leslie Lamport's timestamp algorithm for distributed computing as described in hist landmark paper ["Time, Clock, and the Ordering of Events in a Distributed System"](http://research.microsoft.com/users/lamport/pubs/time-clocks.pdf) (1978).
 
 ### Usage
 
-This is a normal sbt project. You can compile code with `sbt compile`, run it with `sbt run`, and `sbt console` will start a Scala 3 REPL.
+This is a normal sbt project. You can:
+- Compile the code with `sbt compile`
+- Test it with `sbt test`
+- Run it with `sbt run`
 
-For more information on the sbt-dotty plugin, see the
-[scala3-example-project](https://github.com/scala/scala3-example-project/blob/main/README.md).
+`sbt console` will start the Scala REPL.
+

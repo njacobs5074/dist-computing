@@ -1,90 +1,34 @@
 import akka.actor.typed.ActorRef
 import akka.actor.typed.Behavior
 import akka.actor.typed.scaladsl.Behaviors
-import akka.actor.typed.scaladsl.TimerScheduler
+import akka.actor.typed.scaladsl.StashBuffer
 
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import scala.collection.mutable
 import scala.concurrent.duration._
 import scala.language.postfixOps
 import scala.util.control.Breaks
 
-object Network {
-  import Processor.{ Message => ProcessorMessage }
-
-  sealed trait Message
-  final case class RegisterProcessor(id: Int, source: ActorRef[ProcessorMessage])   extends Message
-  final case class UnregisterProcessor(id: Int, source: ActorRef[ProcessorMessage]) extends Message
-  final case class RequestResource(id: Int, timestamp: Long)                        extends Message
-  final case class ReleaseResource(id: Int, timestamp: Long)                        extends Message
-  final case class RequestResourceAcked(sourceId: Int, targetId: Int, timestamp: Long)
-      extends Message
-
-  def apply(): Behavior[Message] =
-    network(Map.empty)
-
-  private def network(processors: Map[Int, ActorRef[ProcessorMessage]]): Behavior[Message] =
-    Behaviors.setup { context =>
-      context.log.info(
-        s"Network running: active processors = [${processors.keySet.toList.sorted.mkString(",")}]"
-      )
-      Behaviors.receiveMessagePartial {
-        case RegisterProcessor(id, processor) =>
-          processor ! Processor.Registered()
-          network(processors + (id -> processor))
-
-        case UnregisterProcessor(id, processor) =>
-          processor ! Processor.Unregistered()
-          network(processors - id)
-
-        case RequestResource(requestorId, timestamp) =>
-          processors.foreach { case (id, processor) =>
-            if (id != requestorId) {
-              context.log
-                .info(s"Sending resource request to Processor[$id] from Processor[$requestorId]")
-              processor ! Processor.RequestResource(requestorId, timestamp)
-            }
-          }
-          Behaviors.same
-
-        case ReleaseResource(requestorId, timestamp) =>
-          processors.foreach { case (id, processor) =>
-            if (id != requestorId) {
-              context.log.info(
-                s"Sending resource release to Processor[$id] from Processor[$requestorId]"
-              )
-              processor ! Processor.ReleaseResource(requestorId, timestamp)
-            }
-          }
-          Behaviors.same
-
-        case RequestResourceAcked(sourceId, targetId, timestamp) =>
-          processors.get(targetId).foreach { processor =>
-            context.log.info(
-              s"Sending resource request ack to Processor[$targetId] from Processor[$sourceId]"
-            )
-            processor ! Processor.RequestResourceAcked(sourceId, timestamp)
-          }
-          Behaviors.same
-
-      }
-    }
-}
-
+//noinspection ScalaFileName
 object Processor {
 
   sealed trait Message
-  final case class RequestResource(id: Int, timestamp: Long)      extends Message
-  final case class RequestResourceAcked(id: Int, timestamp: Long) extends Message
-  final case class ReleaseResource(id: Int, timestamp: Long)      extends Message
 
-  final case class Boot()         extends Message
-  final case class StartWork()    extends Message
-  final case class StopWork()     extends Message
-  final case class Shutdown()     extends Message
-  final case class Registered()   extends Message
-  final case class Unregistered() extends Message
-  final case class ClockTick()    extends Message
+  final case class RequestResource(id: Int, timestamp: Long)                   extends Message
+  final case class RequestResourceAcked(id: Int, timestamp: Long)              extends Message
+  final case class ReleaseResource(id: Int, timestamp: Long)                   extends Message
+  final case class Boot(processors: Array[ActorRef[Message]])                  extends Message
+  final case class ClockTick()                                                 extends Message
+  final case class Registered(id: Int, processor: ActorRef[Processor.Message]) extends Message
+  final case class RegisterProcessor(id: Int, processor: ActorRef[Processor.Message])
+      extends Message
+  final case class ResourceUseEvent(
+    inUse: Boolean,
+    id: Int,
+    timestamp: Long,
+    proessor: ActorRef[Processor.Message]
+  ) extends Message
 
   class Clock extends AtomicLong(0L) {
     val breaks = new Breaks
@@ -103,113 +47,128 @@ object Processor {
     }
   }
 
-  class Instance(val id: Int, val numProcessors: Int) {
+  implicit class PriorityQueueExt(queue: mutable.PriorityQueue[RequestResource]) {
+    // Painful but true, to remove all the items that are not Processor[id]
+    // we have to dequeue all the items, keeping the ones that are not
+    // Processor[id] and then re-add them. <sigh>
+    def removeAll(id: Int): Unit =
+      queue.addAll(queue.dequeueAll.filterNot(_.id == id))
+  }
+
+  class Instance(val id: Int, val numProcessors: Int, val listener: ActorRef[ResourceUseEvent]) {
     // Ordering that will cause the RequestResource to be ordered by its timestamp in ascending fashion
     implicit def ordering: Ordering[RequestResource] = Ordering.by(_.timestamp * -1L)
 
     val clock: Clock                                  = new Clock
-    val useClock                                      = false
+    val isUsingResource                               = new AtomicBoolean(false)
     val queue: mutable.PriorityQueue[RequestResource] = mutable.PriorityQueue.empty
+    val otherProcessors: mutable.HashMap[Int, ActorRef[Message]] =
+      mutable.HashMap.empty[Int, ActorRef[Message]]
 
-    def isResourceAvailable: Boolean =
-      !queue.isEmpty && queue.head.id == id && queue.filterNot(_.id == id).size == numProcessors - 1
+    def isResourceAvailable: Boolean = {
+      val queueSnapshot = queue.clone().dequeueAll
+      queueSnapshot.nonEmpty && queueSnapshot.head.id == id &&
+      queueSnapshot.filterNot(_.id == id).size == numProcessors - 1
+    }
+
+    override def toString: String =
+      s"Processor[$id]"
   }
 
-  def apply(id: Int, numProcessors: Int, network: ActorRef[Network.Message]): Behavior[Message] =
-    Behaviors.withTimers(timers => boot(timers, new Instance(id, numProcessors), network))
+  def apply(id: Int, numProcessors: Int, listener: ActorRef[ResourceUseEvent]): Behavior[Message] =
+    Behaviors.withStash(10)(preBoot(new Instance(id, numProcessors, listener), _))
 
-  private def boot(
-    timers: TimerScheduler[Message],
-    processor: Instance,
-    network: ActorRef[Network.Message]
-  ): Behavior[Message] =
-    Behaviors.setup { context =>
-      context.log.info(s"Processor[${processor.id}] booting up...")
-      timers.startTimerAtFixedRate(ClockTick(), 1 second)
-
-      Behaviors.receiveMessagePartial {
-        case Boot() =>
-          context.log.info(s"Processor[${processor.id}] connecting to network...")
-          network ! Network.RegisterProcessor(processor.id, context.self)
-          Behaviors.same
-        case Registered() =>
-          context.log.info(s"Processor[${processor.id}] connected to network")
-          processor.queue.enqueue(RequestResource(processor.id, 0L))
-          running(timers, processor, network)
-      }
-    }
-
-  private def running(
-    timers: TimerScheduler[Message],
-    processor: Instance,
-    network: ActorRef[Network.Message]
-  ): Behavior[Message] =
-    Behaviors.setup { context =>
-      context.log.info(s"Processor[${processor.id}] online...")
-      Behaviors.receiveMessagePartial {
-        case ClockTick() =>
-          if (processor.isResourceAvailable) {
-            context.log.info(s"Processor[${processor.id}] using resource at ${processor.clock.get}")
-            context.self ! ReleaseResource(processor.id, processor.clock.addAndGet(1L))
-          }
-          Behaviors.same
-
-        case StartWork() =>
-          context.log.info(s"Processor[${processor.id}] requesting access to resource...")
-          val msg = RequestResource(processor.id, processor.clock.addAndGet(1L))
-          processor.queue.addOne(msg)
-          network ! Network.RequestResource(processor.id, msg.timestamp)
-          Behaviors.same
-
-        case RequestResource(id, timestamp) =>
-          context.log.info(s"Processor[$id] requested access to resource at $timestamp")
-          processor.clock.setIfGreater(timestamp + 1)
-          val msg = RequestResource(id, timestamp)
-          processor.queue.enqueue(msg)
-          network ! Network.RequestResourceAcked(processor.id, id, processor.clock.addAndGet(1L))
-          Behaviors.same
-
-        case RequestResourceAcked(id, timestamp) =>
-          context.log.info(s"Processor[$id] ack'ed resource request at $timestamp")
-          processor.clock.setIfGreater(timestamp + 1)
-          Behaviors.same
-
-        case ReleaseResource(id, timestamp) =>
-          processor.clock.setIfGreater(timestamp + 1)
-          context.log.info(s"Processor[$id] releasing access to resource at ${processor.clock.get}")
-
-          // Painful but true, to remove all the items that are not Processor[id]
-          // we have to dequeue all the items, keeping the ones that are not
-          // Processor[id] and then re-add them. <sigh>
-          processor.queue.addAll(processor.queue.dequeueAll.filterNot(_.id == id))
-
-          Behaviors.same
-
-        case StopWork() =>
-          context.log.info(s"Processor ${processor.id} stopping work")
-          processor.queue.addAll(processor.queue.dequeueAll.filterNot(_.id == processor.id))
-          network ! Network.ReleaseResource(processor.id, processor.clock.addAndGet(1L))
-          Behaviors.same
-
-        case Shutdown() =>
-          network ! Network.UnregisterProcessor(processor.id, context.self)
-          shutdown(timers, processor, network)
-      }
-    }
-
-  private def shutdown(
-    timers: TimerScheduler[Message],
-    processor: Instance,
-    network: ActorRef[Network.Message]
-  ): Behavior[Message] =
-    Behaviors.receive { (context, message) =>
+  private def preBoot(processor: Instance, buffer: StashBuffer[Message]) =
+    Behaviors.receive[Message] { case (context, message) =>
       message match {
-        case Unregistered() =>
-          context.log.info(s"Processor ${processor.id} disconnected from network")
-          boot(timers, processor, network)
+        case Boot(processors) =>
+          registerMe(processor.id, context.self, processors)
+          boot(processor, buffer)
 
-        case _ =>
-          Behaviors.unhandled
+        case other =>
+          buffer.stash(other)
+          Behaviors.same
       }
     }
+
+  private def boot(processor: Instance, buffer: StashBuffer[Message]): Behavior[Message] =
+    Behaviors.setup { context =>
+      context.log.info(s"$processor booting up...")
+
+      Behaviors.receiveMessage {
+        case RegisterProcessor(id, otherProcessor) =>
+          processor.otherProcessors += id -> otherProcessor
+          context.log.info(
+            s"$processor saw another processor: ${processor.otherProcessors.values.mkString(",")}"
+          )
+
+          if (processor.otherProcessors.size == processor.numProcessors - 1) {
+            buffer.unstashAll(running(processor))
+          } else {
+            Behaviors.same
+          }
+
+        case other =>
+          buffer.stash(other)
+          Behaviors.same
+
+      }
+    }
+
+  private def running(processor: Instance): Behavior[Message] =
+    Behaviors.withTimers { timers =>
+      Behaviors.setup { context =>
+        context.log.info(s"$processor online...")
+        timers.startTimerAtFixedRate(ClockTick(), 1 second)
+        Behaviors.receiveMessagePartial {
+          case ClockTick() =>
+            if (processor.isResourceAvailable) {
+              context.log.info(
+                s"Processor[${processor.id}] using resource at ${processor.clock.get}"
+              )
+              processor.listener ! ResourceUseEvent(
+                inUse = true,
+                processor.id,
+                processor.clock.get,
+                context.self
+              )
+              context.self ! ReleaseResource(processor.id, processor.clock.addAndGet(1L))
+            } else {
+              processor.clock.addAndGet(1L)
+              processor.otherProcessors.values.foreach(
+                _ ! RequestResource(processor.id, processor.clock.get())
+              )
+            }
+            Behaviors.same
+
+          case RequestResource(id, timestamp) =>
+            context.log.info(s"Processor[$id] requested access to resource at $timestamp")
+            processor.clock.setIfGreater(timestamp + 1)
+            val msg = RequestResource(id, timestamp)
+            processor.queue.enqueue(msg)
+            processor.otherProcessors(id) ! RequestResourceAcked(id, processor.clock.get)
+            Behaviors.same
+
+          case RequestResourceAcked(id, timestamp) =>
+            context.log.info(s"Processor[$id] ack'ed resource request at $timestamp")
+            processor.clock.setIfGreater(timestamp + 1)
+            Behaviors.same
+
+          case ReleaseResource(id, timestamp) =>
+            processor.clock.setIfGreater(timestamp + 1)
+            context.log.info(s"$processor releasing access to resource at ${processor.clock.get}")
+            processor.queue.removeAll(id)
+            Behaviors.same
+
+        }
+      }
+    }
+
+  private def registerMe(
+    id: Int,
+    self: ActorRef[Message],
+    processors: Array[ActorRef[Message]]
+  ): Unit =
+    (processors.slice(0, id) ++ processors.slice(id + 1, processors.length))
+      .foreach(processor => processor ! RegisterProcessor(id, self))
 }

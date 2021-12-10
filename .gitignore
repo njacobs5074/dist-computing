@@ -4,3 +4,4 @@ target/
 .bsp/
 .metals/
 **/metals.sbt
+.idea/
