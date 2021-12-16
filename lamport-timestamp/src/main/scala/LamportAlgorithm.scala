@@ -23,7 +23,6 @@ object Processor {
         this.timestamp - that.timestamp
       }.toInt * -1
   }
-
   final case class RequestResourceAcked(id: Int, timestamp: Long)                                     extends Message
   final case class ReleaseResource(id: Int, timestamp: Long)                                          extends Message
   final case class Boot(processors: Array[ActorRef[Message]])                                         extends Message

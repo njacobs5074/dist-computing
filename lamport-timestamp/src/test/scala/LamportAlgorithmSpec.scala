@@ -46,32 +46,33 @@ class LamportAlgorithmSpec extends AnyWordSpec with BeforeAndAfterAll with LogCa
       assert(msgs.size == 1)
       processors.foreach(processor => stop(processor.ref))
     }
-  }
 
-  "confirm a processor releases the resource after it acquires it" in {
-    val eventListener = createTestProbe[Processor.Message]()
-    val processors = Array(
-      spawn(Processor(0, 2, eventListener.ref), "processor-01"),
-      spawn(Processor(1, 2, eventListener.ref), "processor-02")
-    )
+    "confirm a processor releases the resource after it acquires it" in {
+      val eventListener = createTestProbe[Processor.Message]()
+      val processors = Array(
+        spawn(Processor(0, 2, eventListener.ref), "processor-01"),
+        spawn(Processor(1, 2, eventListener.ref), "processor-02")
+      )
 
-    processors.foreach(_ ! Processor.Boot(processors))
-    var resourceUseEvent: Option[Processor.ResourceUseEvent] = None
-    val msgs = eventListener.fishForMessage(5.seconds) {
-      case Processor.ResourceUseEvent(id, timestamp, actorRef) =>
-        info(s"Processor[$id] is using resource at $timestamp")
-        resourceUseEvent = Some(Processor.ResourceUseEvent(id, timestamp, actorRef))
-        FishingOutcomes.continue
+      processors.foreach(_ ! Processor.Boot(processors))
+      var resourceUseEvent: Option[Processor.ResourceUseEvent] = None
+      val msgs = eventListener.fishForMessage(5.seconds) {
+        case Processor.ResourceUseEvent(id, timestamp, actorRef) =>
+          resourceUseEvent = Some(Processor.ResourceUseEvent(id, timestamp, actorRef))
+          FishingOutcomes.continue
 
-      case Processor.ReleaseResource(id, timestamp) if resourceUseEvent.isDefined =>
-        info(s"Processor[$id] is stopped resource at $timestamp")
-        FishingOutcomes.complete
+        case Processor.ReleaseResource(_, _) if resourceUseEvent.isDefined =>
+          FishingOutcomes.complete
 
-      case _ =>
-        FishingOutcomes.continue
+        case Processor.ReleaseResource(_, _) =>
+          FishingOutcomes.fail("Got a ReleaseResource having never seen a ResourceUseEvent")
+
+        case _ =>
+          FishingOutcomes.continue
+      }
+
+      assert(msgs.size == 2)
+      processors.foreach(processor => stop(processor.ref))
     }
-
-    assert(msgs.size == 2)
-    processors.foreach(processor => stop(processor.ref))
   }
 }
